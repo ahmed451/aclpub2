@@ -1,5 +1,76 @@
 # How to generate proceedings for \*CL Conferences and Workshops in aclpub2 format
 
+## About this fork, What Changed?
+
+This fork adapts `openreview/or2papers.py` to venues created with OpenReview's
+newer submission form, which the upstream exporter cannot read. It was written
+while producing the ArabicNLP 2026 proceedings, where the main conference used
+the older form and every shared task used the newer one.
+
+### The problem
+
+Older OpenReview venues store author identity in two fields:
+
+```yaml
+authors:   ["Jane Doe", "John Roe"]
+authorids: ["~Jane_Doe1", "~John_Roe1"]
+```
+
+Newer venues store it as a single structured field, and have no `authorids`
+at all:
+
+```yaml
+authors:
+  - username: "~Jane_Doe1"
+    fullname: "Jane Doe"
+    institutions:
+      - {name: "Example University", domain: "example.edu", country: "SA"}
+```
+
+Upstream `or2papers.py` reads only `authorids`. On a newer venue that field is
+absent, `get_content_from` returns an empty string, the author loop never runs,
+and the export dies on `assert len(authors) > 0` with no indication of why.
+
+### Changes
+
+**`openreview/author_fallback.py` (new)**
+
+- Reads author identity from the structured `authors` field, accepting plain
+  strings, `{"value": ...}` wrappers, `{"fullname": ...}` and
+  `{"first"/"middle"/"last": ...}` records.
+- Uses the `username` carried by each entry as the profile ID, so authors
+  resolve through the normal `util.get_user` path with full emails and
+  affiliations — no loss of data relative to the old format.
+- Where no ID is present, searches OpenReview by exact full name and accepts
+  the result only when exactly one profile matches, so common names are never
+  silently attached to the wrong person.
+- Falls back to a name-only record as a last resort, applying the same
+  first/middle/last splitting rules as `util.get_user` (including surname
+  particles such as `de`, `van der`, `El`).
+- Logs every author it resolves this way to `papers.log`, marking name-only
+  records `NAME ONLY`. **Those entries have no email and `institution: NA`,
+  and are not sufficient for Anthology ingestion** — treat them as a punch
+  list, not a finished export.
+
+**`openreview/or2papers.py`**
+
+- Falls back to `venueid = <venue>/Submission` when `<venue>` matches no
+  papers, and reuses the matched ID in the decision-by-venueid branch. The
+  unpatched branch compares each note's `venueid` against the unsuffixed
+  venue, which can never match once the fallback has been taken.
+- Replaces `assert len(authors) > 0` with a logged skip and a warning, so one
+  unreadable submission no longer aborts an entire export.
+- Prints a run summary, and warns when every paper's `decision` is
+  `Submission` — a sign the venue has not assigned decided venue IDs yet, so
+  the `decision` field in `papers.yml` is not meaningful.
+
+`openreview/util.py` is unchanged from upstream.
+
+### Compatibility
+
+Venues using the old two-field format are unaffected: `authorids` is read
+first and the new code path only runs when that field is missing.
+
 **aclpub2** supports the generation of Proceedings and Booklets for \*CL Conferences (ACL, NAACL, EMNLP, ... ) and related Workshops. 
 This README has been created to provide the instructions to follow to generate proceedings/booklets in aclpub2 format. 
 

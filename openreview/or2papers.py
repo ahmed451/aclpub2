@@ -5,6 +5,11 @@
 # Created By Rodrigo Wilkens
 # Last update 02/April/2022
 # version ='1.0'
+#
+# Patched for ArabicNLP 2026:
+#   * the venueid fallback now also drives the decision-by-venueid branch
+#   * submissions whose `authorids` field is not readable fall back to the
+#     readable `authors` names (see author_fallback.py)
 # ---------------------------------------------------------------------------
 
 import argparse
@@ -15,6 +20,8 @@ from tqdm import tqdm
 import sys
 from util import *
 import openreview.api
+
+from author_fallback import authors_from_names
 
 
 def main(username, password, venue, download_all, download_pdfs):
@@ -45,15 +52,26 @@ def main(username, password, venue, download_all, download_pdfs):
     if not os.path.exists(attachments_folder):
         os.mkdir(attachments_folder)
 
-    submissions = client_acl_v2.get_all_notes(content={ 'venueid': venue}, details='replies')
+    # `venue_id` is whichever venueid actually matched, so the decision branch
+    # below compares against the same value we queried with.
+    venue_id = venue
+    submissions = client_acl_v2.get_all_notes(content={'venueid': venue_id}, details='replies')
+
+    if len(submissions) <= 0:
+        venue_id = venue + '/Submission'
+        submissions = client_acl_v2.get_all_notes(content={'venueid': venue_id}, details='replies')
+        if len(submissions) > 0:
+            print(f"Note: no papers carry venueid={venue}; using venueid={venue_id} instead.")
+            print("      These submissions have not been moved to a decided venue id.")
+
     if len(submissions) <= 0:
         print("No submissions found. Please double check your venue ID and/or permissions to view the submissions")
-
+        sys.exit(1)
     ## Publication chairs do not have access to the forum replies - use venueid instead
     if len(submissions[0].details["replies"]) <= 0:
         decision_by_forum = {
             s.forum: s
-            for s in submissions if s.content["venueid"]["value"] == venue
+            for s in submissions if s.content["venueid"]["value"] == venue_id
         }
     else:
         decision_by_forum = {
@@ -64,6 +82,7 @@ def main(username, password, venue, download_all, download_pdfs):
 
     papers = []
     abstract_flag, paper_type_flag, track_flag = False, False, False
+    fallback_papers, unresolved_total = 0, 0
     small_log = open("papers.log", "w")
     for submission in tqdm(submissions):
         if submission.id not in decision_by_forum:
@@ -86,7 +105,28 @@ def main(username, password, venue, download_all, download_pdfs):
                 )
             if author:
                 authors.append(author)
-        assert len(authors) > 0
+
+        if not authors:
+            # `authorids` is not readable for this submission (the field is
+            # restricted to the track's chairs).  Recover what we can from the
+            # readable `authors` names instead of aborting the whole run.
+            small_log.write(
+                f"\n--- #{submission.number} ({submission.id}) has no readable authorids; "
+                f"falling back to the `authors` names ---\n"
+            )
+            authors, unresolved = authors_from_names(
+                submission, client_acl_v2, get_user, log=small_log
+            )
+            if authors:
+                fallback_papers += 1
+                unresolved_total += unresolved
+
+        if not authors:
+            small_log.write(
+                f"#{submission.number} ({submission.id}) SKIPPED: no author information at all\n"
+            )
+            print(f"\nWARNING: no authors for #{submission.number} ({submission.id}); skipping")
+            continue
 
         if "abstract" in submission.content:
             abstract = get_content_from(submission, "abstract")
@@ -179,6 +219,19 @@ def main(username, password, venue, download_all, download_pdfs):
 
     papers.sort(key=lambda p: p["id"])
     yaml.dump(papers, open("papers.yml", "w"), allow_unicode=True)
+
+    print(f"\nWrote {len(papers)} papers to papers.yml")
+    if fallback_papers:
+        print(f"  {fallback_papers} paper(s) had no readable authorids and were "
+              f"rebuilt from the `authors` names.")
+        if unresolved_total:
+            print(f"  {unresolved_total} author(s) could not be matched to an "
+                  f"OpenReview profile and have no email or affiliation.")
+        print("  Review papers.log before using this output for the Anthology.")
+    decisions = {p["decision"] for p in papers}
+    if decisions and decisions <= {"Submission"}:
+        print("  WARNING: every decision is 'Submission'. These papers have not "
+              "been assigned a decided venue id on OpenReview yet.")
 
 
 if __name__ == "__main__":
